@@ -7,7 +7,7 @@ import {
 	Connection, TextDocuments, InitializeParams, InitializeResult, ServerCapabilities, ConfigurationRequest, WorkspaceFolder, TextDocumentSyncKind, NotificationType, Disposable, TextDocumentIdentifier, Range, FormattingOptions, TextEdit, Diagnostic
 } from 'vscode-languageserver';
 import { URI } from 'vscode-uri';
-import { getCSSLanguageService, getSCSSLanguageService, getLESSLanguageService, LanguageSettings, LanguageService, Stylesheet, TextDocument, Position } from 'vscode-css-languageservice';
+import { CSSFormatConfiguration, getCSSLanguageService, getSCSSLanguageService, getLESSLanguageService, LanguageSettings as LS, LanguageService, Stylesheet, TextDocument, Position } from 'vscode-css-languageservice';
 import { getLanguageModelCache } from './languageModelCache';
 import { runSafeAsync } from './utils/runner';
 import { DiagnosticsSupport, registerDiagnosticsPullSupport, registerDiagnosticsPushSupport } from './utils/validation';
@@ -17,6 +17,11 @@ import { RequestService, getRequestService } from './requests';
 
 namespace CustomDataChangedNotification {
 	export const type: NotificationType<string[]> = new NotificationType('css/customDataChanged');
+}
+
+// Extend CSS language service settings with format configuration options
+interface LanguageSettings extends LS {
+	format?: CSSFormatConfiguration;
 }
 
 export interface Settings {
@@ -63,6 +68,23 @@ export function startServer(connection: Connection, runtime: RuntimeEnvironment)
 
 	const notReady = () => Promise.reject('Not Ready');
 	let requestService: RequestService = { getContent: notReady, stat: notReady, readDirectory: notReady };
+
+	// Stores formatter configuration for each supported language. Upon LSP format request,
+	// the incoming FormattingOptions are merged with the respective language's settings before
+	// forwarding to the language service. This is necessary as the language service currently
+	// does not track these settings itself and formats based on the forwarded configuration options.
+	const formatterSettings: { [language: string]: LanguageSettings['format'] } = {};
+
+	function getFormatterSettings(document: TextDocument): LanguageSettings['format'] {
+		let settings = formatterSettings[document.languageId];
+
+		if (!settings) {
+			connection.console.log(`Document language is '${document.languageId}' (unsupported), using 'css' settings instead.`);
+			settings = formatterSettings['css'];
+		}
+
+		return settings ?? {};
+	}
 
 	// After the server has started the client sends an initialize request. The server receives
 	// in the passed params the rootPath of the workspace plus the client capabilities.
@@ -170,6 +192,7 @@ export function startServer(connection: Connection, runtime: RuntimeEnvironment)
 	function updateConfiguration(settings: any) {
 		for (const languageId in languageServices) {
 			languageServices[languageId].configure(settings[languageId]);
+			formatterSettings[languageId] = settings[languageId].format;
 		}
 		// reset all document settings
 		documentSettings = {};
@@ -356,7 +379,15 @@ export function startServer(connection: Connection, runtime: RuntimeEnvironment)
 	async function onFormat(textDocument: TextDocumentIdentifier, range: Range | undefined, options: FormattingOptions): Promise<TextEdit[]> {
 		const document = documents.get(textDocument.uri);
 		if (document) {
-			const edits = getLanguageService(document).format(document, range ?? getFullRange(document), options);
+			// Merges the incoming options with the respective language's settings before forwarding to the
+			// language service. This is necessary as the language service currently does not track these
+			// settings itself and formats based on the forwarded configuration options.
+			const settings = {
+				...options,
+				...getFormatterSettings(document),
+			};
+
+			const edits = getLanguageService(document).format(document, range ?? getFullRange(document), settings);
 			if (edits.length > formatterMaxNumberOfEdits) {
 				const newText = TextDocument.applyEdits(document, edits);
 				return [TextEdit.replace(getFullRange(document), newText)];
@@ -384,6 +415,3 @@ export function startServer(connection: Connection, runtime: RuntimeEnvironment)
 function getFullRange(document: TextDocument): Range {
 	return Range.create(Position.create(0, 0), document.positionAt(document.getText().length));
 }
-
-
-
